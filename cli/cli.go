@@ -6,6 +6,7 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -219,6 +220,26 @@ Synopsis:
 		gojq.WithVariables(cli.argnames),
 		gojq.WithFunction("debug", 0, 0, cli.funcDebug),
 		gojq.WithFunction("stderr", 0, 0, cli.funcStderr),
+		gojq.WithFunction("exec", 0, 0, func(i interface{}, _ []interface{}) interface{} {
+			ss, ok := i.([]interface{})
+			if !ok {
+				return nil
+			}
+			var cmds []string
+			for _, s := range ss {
+				s, ok := s.(string)
+				if !ok {
+					return nil
+				}
+				cmds = append(cmds, s)
+			}
+			cmd := exec.Command(cmds[0], cmds[1:]...)
+			b, err := cmd.Output()
+			if err != nil {
+				panic(err)
+			}
+			return string(b)
+		}),
 		gojq.WithInputIter(iter),
 	)
 	if err != nil {
