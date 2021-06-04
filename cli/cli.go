@@ -48,6 +48,7 @@ type cli struct {
 	inputSlurp    bool
 	inputStream   bool
 	inputYAML     bool
+	disableUnsafe bool
 
 	argnames  []string
 	argvalues []interface{}
@@ -79,6 +80,7 @@ type flagopts struct {
 	RawFile       map[string]string `long:"rawfile" description:"set variable to the contents of the file" count:"2" unquote:"false"`
 	ExitStatus    bool              `short:"e" long:"exit-status" description:"exit 1 when the last value is false or null"`
 	Version       bool              `short:"v" long:"version" description:"print version"`
+	DisableUnsafe bool              `long:"disable-unsafe" description:"disable unsafe filters"`
 }
 
 var addDefaultModulePaths = true
@@ -120,9 +122,9 @@ Synopsis:
 		return nil
 	}
 	cli.outputCompact, cli.outputRaw, cli.outputJoin, cli.outputNul,
-		cli.outputYAML, cli.outputIndent, cli.outputTab =
+		cli.outputYAML, cli.outputIndent, cli.outputTab, cli.disableUnsafe =
 		opts.OutputCompact, opts.OutputRaw, opts.OutputJoin, opts.OutputNul,
-		opts.OutputYAML, opts.OutputIndent, opts.OutputTab
+		opts.OutputYAML, opts.OutputIndent, opts.OutputTab, opts.DisableUnsafe
 	defer func(x bool) { noColor = x }(noColor)
 	if opts.OutputColor || opts.OutputMono {
 		noColor = opts.OutputMono
@@ -213,35 +215,22 @@ Synopsis:
 		}
 	}
 	iter := cli.createInputIter(args)
-	defer iter.Close()
-	code, err := gojq.Compile(query,
+	copts := []gojq.CompilerOption{
 		gojq.WithModuleLoader(gojq.NewModuleLoader(modulePaths)),
 		gojq.WithEnvironLoader(os.Environ),
 		gojq.WithVariables(cli.argnames),
 		gojq.WithFunction("debug", 0, 0, cli.funcDebug),
 		gojq.WithFunction("stderr", 0, 0, cli.funcStderr),
-		gojq.WithFunction("exec", 0, 0, func(i interface{}, _ []interface{}) interface{} {
-			ss, ok := i.([]interface{})
-			if !ok {
-				return nil
-			}
-			var cmds []string
-			for _, s := range ss {
-				s, ok := s.(string)
-				if !ok {
-					return nil
-				}
-				cmds = append(cmds, s)
-			}
-			cmd := exec.Command(cmds[0], cmds[1:]...)
-			b, err := cmd.Output()
-			if err != nil {
-				panic(err)
-			}
-			return string(b)
-		}),
 		gojq.WithInputIter(iter),
-	)
+	}
+	if !cli.disableUnsafe {
+		copts = append(copts,
+			gojq.WithFunction("execpipe", 2, 2, funcExecPipe),
+			gojq.WithFunction("exec", 2, 2, funcExec),
+		)
+	}
+	defer iter.Close()
+	code, err := gojq.Compile(query, copts...)
 	if err != nil {
 		if err, ok := err.(interface {
 			QueryParseError() (string, string, string, error)
@@ -264,6 +253,49 @@ Synopsis:
 		iter = newNullInputIter()
 	}
 	return cli.process(iter, code)
+}
+func funcExec(_ interface{}, i2 []interface{}) interface{} {
+	return funcExecImpl("exec", nil, i2)
+}
+
+func funcExecPipe(i interface{}, i2 []interface{}) interface{} {
+	return funcExecImpl("execpipe", i, i2)
+}
+
+func funcExecImpl(funcname string, i interface{}, i2 []interface{}) interface{} {
+	input, ok := i.(string)
+	if !ok {
+		if i != nil {
+			return fmt.Errorf("exec/2 filter input must be string: %v", i)
+		}
+		input = ""
+	}
+	executablePath, ok := i2[0].(string)
+	if !ok {
+		return fmt.Errorf("%s/2 the first argument must be string: %v", funcname, i2[0])
+	}
+	args, ok := i2[1].([]interface{})
+	if !ok {
+		return fmt.Errorf("%s/2 the second argument must be array of string: %v", funcname, i2[1])
+	}
+	var cmds []string
+	for _, s := range args {
+		s, ok := s.(string)
+		if !ok {
+			return fmt.Errorf("%s/2 the second argument must be array of string: %v", funcname, i2[1])
+		}
+		cmds = append(cmds, s)
+	}
+	cmd := exec.Command(executablePath, cmds...)
+	cmd.Stdin = strings.NewReader(input)
+	b, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	if cmd.ProcessState.ExitCode() != 0 {
+		return fmt.Errorf("%s/2 returns non-zero status: %d", funcname, cmd.ProcessState.ExitCode())
+	}
+	return string(b)
 }
 
 func slurpFile(name string) (interface{}, error) {
